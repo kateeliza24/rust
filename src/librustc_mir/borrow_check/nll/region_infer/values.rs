@@ -10,7 +10,7 @@
 
 use rustc::mir::{BasicBlock, Location, Mir};
 use rustc::ty::{self, RegionVid};
-use rustc_data_structures::bitvec::SparseBitMatrix;
+use rustc_data_structures::bitvec::{BitArray, SparseBitMatrix};
 use rustc_data_structures::indexed_vec::Idx;
 use rustc_data_structures::indexed_vec::IndexVec;
 use std::fmt::Debug;
@@ -20,13 +20,23 @@ use std::rc::Rc;
 crate struct RegionValueElements {
     /// For each basic block, how many points are contained within?
     statements_before_block: IndexVec<BasicBlock, usize>,
+
+    /// Map backward from each point into to one of two possible values:
+    ///
+    /// - `None`: if this point index represents a Location with non-zero index
+    /// - `Some(bb)`: if this point index represents a Location with zero index
+    ///
+    /// NB. It may be better to just map back to a full `Location`. We
+    /// should probably try that.
+    basic_block_heads: IndexVec<PointIndex, Option<BasicBlock>>,
+
     num_points: usize,
 }
 
 impl RegionValueElements {
     crate fn new(mir: &Mir<'_>) -> Self {
         let mut num_points = 0;
-        let statements_before_block = mir
+        let statements_before_block: IndexVec<BasicBlock, usize> = mir
             .basic_blocks()
             .iter()
             .map(|block_data| {
@@ -41,14 +51,27 @@ impl RegionValueElements {
         );
         debug!("RegionValueElements: num_points={:#?}", num_points);
 
+        let mut basic_block_heads: IndexVec<PointIndex, Option<BasicBlock>> =
+            (0..num_points).map(|_| None).collect();
+        for (bb, &first_point) in statements_before_block.iter_enumerated() {
+            let first_point = PointIndex::new(first_point);
+            basic_block_heads[first_point] = Some(bb);
+        }
+
         Self {
             statements_before_block,
+            basic_block_heads,
             num_points,
         }
     }
 
+    /// Total number of point indices
+    crate fn num_points(&self) -> usize {
+        self.num_points
+    }
+
     /// Converts a `Location` into a `PointIndex`. O(1).
-    fn point_from_location(&self, location: Location) -> PointIndex {
+    crate fn point_from_location(&self, location: Location) -> PointIndex {
         let Location {
             block,
             statement_index,
@@ -57,39 +80,59 @@ impl RegionValueElements {
         PointIndex::new(start_index + statement_index)
     }
 
+    /// Converts a `Location` into a `PointIndex`. O(1).
+    crate fn entry_point(&self, block: BasicBlock) -> PointIndex {
+        let start_index = self.statements_before_block[block];
+        PointIndex::new(start_index)
+    }
+
     /// Converts a `PointIndex` back to a location. O(N) where N is
     /// the number of blocks; could be faster if we ever cared.
-    crate fn to_location(&self, i: PointIndex) -> Location {
-        let point_index = i.index();
+    crate fn to_location(&self, index: PointIndex) -> Location {
+        assert!(index.index() < self.num_points);
 
-        // Find the basic block. We have a vector with the
-        // starting index of the statement in each block. Imagine
-        // we have statement #22, and we have a vector like:
-        //
-        // [0, 10, 20]
-        //
-        // In that case, this represents point_index 2 of
-        // basic block BB2. We know this because BB0 accounts for
-        // 0..10, BB1 accounts for 11..20, and BB2 accounts for
-        // 20...
-        //
-        // To compute this, we could do a binary search, but
-        // because I am lazy we instead iterate through to find
-        // the last point where the "first index" (0, 10, or 20)
-        // was less than the statement index (22). In our case, this will
-        // be (BB2, 20).
-        //
-        // Nit: we could do a binary search here but I'm too lazy.
-        let (block, &first_index) = self
-            .statements_before_block
-            .iter_enumerated()
-            .filter(|(_, first_index)| **first_index <= point_index)
-            .last()
-            .unwrap();
+        let mut statement_index = 0;
 
-        Location {
-            block,
-            statement_index: point_index - first_index,
+        for opt_bb in self.basic_block_heads.raw[..= index.index()].iter().rev() {
+            if let &Some(block) = opt_bb {
+                return Location { block, statement_index };
+            }
+
+            statement_index += 1;
+        }
+
+        bug!("did not find basic block as expected for index = {:?}", index)
+    }
+
+    /// Sometimes we get point-indices back from bitsets that may be out of range
+    crate fn point_in_range(&self, index: PointIndex) -> bool {
+        index.index() < self.num_points
+    }
+
+    /// Pushes all predecessors of `index` onto `stack`.
+    crate fn push_predecessors(
+        &self,
+        mir: &Mir<'_>,
+        index: PointIndex,
+        stack: &mut Vec<PointIndex>,
+    ) {
+        match self.basic_block_heads[index] {
+            // If this is a basic block head, then the predecessors are
+            // the the terminators of other basic blocks
+            Some(bb_head) => {
+                stack.extend(
+                    mir
+                        .predecessors_for(bb_head)
+                        .iter()
+                        .map(|&pred_bb| mir.terminator_loc(pred_bb))
+                        .map(|pred_loc| self.point_from_location(pred_loc)),
+                );
+            }
+
+            // Otherwise, the pred is just the previous statement
+            None => {
+                stack.push(PointIndex::new(index.index() - 1));
+            }
         }
     }
 }
@@ -151,6 +194,13 @@ impl<N: Idx> LivenessValues<N> {
         self.points.add(row, index)
     }
 
+    /// Adds all the elements in the given bit array into the given
+    /// region. Returns true if any of them are newly added.
+    crate fn add_elements(&mut self, row: N, locations: &BitArray<PointIndex>) -> bool {
+        debug!("LivenessValues::add_elements(row={:?}, locations={:?})", row, locations);
+        self.points.merge_into(row, locations)
+    }
+
     /// Adds all the control-flow points to the values for `r`.
     crate fn add_all_points(&mut self, row: N) {
         self.points.add_all(row);
@@ -169,6 +219,7 @@ impl<N: Idx> LivenessValues<N> {
                 .row(r)
                 .into_iter()
                 .flat_map(|set| set.iter())
+                .take_while(|&p| self.elements.point_in_range(p))
                 .map(|p| self.elements.to_location(p))
                 .map(RegionElement::Location),
         )
@@ -277,7 +328,11 @@ impl<N: Idx> RegionValues<N> {
         self.points
             .row(r)
             .into_iter()
-            .flat_map(move |set| set.iter().map(move |p| self.elements.to_location(p)))
+            .flat_map(move |set| {
+                set.iter()
+                    .take_while(move |&p| self.elements.point_in_range(p))
+                    .map(move |p| self.elements.to_location(p))
+            })
     }
 
     /// Returns just the universal regions that are contained in a given region's value.
@@ -364,6 +419,19 @@ impl ToElementIndex for ty::UniverseIndex {
         let index = PlaceholderIndex::new(self.as_usize() - 1);
         values.placeholders.contains(row, index)
     }
+}
+
+crate fn location_set_str(
+    elements: &RegionValueElements,
+    points: impl IntoIterator<Item = PointIndex>,
+) -> String {
+    region_value_str(
+        points
+            .into_iter()
+            .take_while(|&p| elements.point_in_range(p))
+            .map(|p| elements.to_location(p))
+            .map(RegionElement::Location),
+    )
 }
 
 fn region_value_str(elements: impl IntoIterator<Item = RegionElement>) -> String {
